@@ -5243,6 +5243,32 @@ flatpak_dir_get_config (FlatpakDir *self,
   return g_key_file_get_string (config, "core", ostree_key, error);
 }
 
+/* Shared requirement gate for transactions and direct deployment callers.
+ * Keeping installation policy here also lets the privileged system helper
+ * consult the target installation's own config during deployment.
+ */
+gboolean
+flatpak_dir_check_required_metadata (FlatpakDir  *self,
+                                     const char *ref,
+                                     GKeyFile   *metakey,
+                                     GError    **error)
+{
+  g_autofree char *check_cpu_features = NULL;
+
+  /* The CPU opt-out does not bypass an independently required Flatpak
+   * version. Preserve that existing check and its error precedence. */
+  if (!flatpak_check_required_version (ref, metakey, error))
+    return FALSE;
+
+  /* Only an explicit stored "false" opts out. Missing, unreadable, or
+   * unrecognized config values keep CPU validation enabled by default. */
+  check_cpu_features = flatpak_dir_get_config (self, "check-cpu-features", NULL);
+  if (g_strcmp0 (check_cpu_features, "false") == 0)
+    return TRUE;
+
+  return flatpak_check_required_cpu_features (ref, metakey, error);
+}
+
 GPtrArray *
 flatpak_dir_get_config_patterns (FlatpakDir *dir, const char *key)
 {
@@ -10332,7 +10358,10 @@ flatpak_dir_deploy (FlatpakDir          *self,
                                       0, error))
         return FALSE;
 
-      if (!flatpak_check_required_version (flatpak_decomposed_get_ref (ref), keyfile, error))
+      /* Recheck the metadata actually read from the checkout. This covers
+       * direct library/system-helper deployment paths as well as transactions
+       * that already checked the resolved metadata before downloading. */
+      if (!flatpak_dir_check_required_metadata (self, flatpak_decomposed_get_ref (ref), keyfile, error))
         return FALSE;
     }
 

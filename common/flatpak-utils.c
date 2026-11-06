@@ -38,11 +38,14 @@
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <limits.h>
+#include <elf.h>
 
 #include <glib.h>
 #include <gio/gunixoutputstream.h>
 
 #include "flatpak-error.h"
+#include "flatpak-metadata-private.h"
 #include "flatpak-utils-base-private.h"
 #include "flatpak-utils-private.h"
 #include "libglnx.h"
@@ -75,6 +78,9 @@ static const GDBusErrorEntry flatpak_error_entries[] = {
   {FLATPAK_ERROR_PERMISSION_DENIED,     "org.freedesktop.Flatpak.Error.PermissionDenied"}, /* Since: 1.5.1 */
   {FLATPAK_ERROR_AUTHENTICATION_FAILED, "org.freedesktop.Flatpak.Error.AuthenticationFailed"}, /* Since: 1.7.3 */
   {FLATPAK_ERROR_NOT_AUTHORIZED,        "org.freedesktop.Flatpak.Error.NotAuthorized"}, /* Since: 1.7.3 */
+  /* Preserve the CPU-specific error domain/code when the system helper
+   * sends a deployment failure back to an unprivileged client over D-Bus. */
+  {FLATPAK_ERROR_UNSUPPORTED_CPU,       "org.freedesktop.Flatpak.Error.UnsupportedCpu"},
 };
 
 GQuark
@@ -2030,6 +2036,313 @@ flatpak_g_ptr_array_contains_string (GPtrArray *array, const char *str)
         return TRUE;
     }
   return FALSE;
+}
+
+/* Review guide: this parser does not read host files or execute CPU-specific
+ * instructions. Its inputs can therefore represent any Linux architecture in
+ * a unit test. The caller supplies CPU info and, optionally, four native-ABI
+ * HWCAP words; the returned owned, NULL-terminated vector contains the exact
+ * requirement strings that those inputs satisfy.
+ *
+ * The selector grammar is implemented by generating satisfied strings:
+ *   cpuinfo:FIELD=VALUE  -- complete trimmed field value
+ *   cpuinfo:FIELD:TOKEN  -- one token in a field
+ *   cpuinfo:FIELD#BIT    -- one set bit in a numeric field
+ *   hwcap[2|3|4]:BIT     -- one set bit in an auxiliary-vector word
+ * Checking metadata later is an exact string membership test, so unknown or
+ * malformed selectors cannot accidentally become satisfied requirements.
+ */
+/* Each field is intersected separately across processors, then the fields are
+ * combined. In particular, x86 "flags", "vmx flags" and "power management"
+ * describe independent sets of capabilities, not alternative CPU lists.
+ * Qualified selectors work with arbitrary fields on any Linux architecture.
+ */
+char **
+flatpak_get_cpu_features (const char          *cpuinfo,
+                          const unsigned long hwcaps[4])
+{
+  /* Work on a private split copy: stripping whitespace and replacing a colon
+   * below never modifies the caller's CPU-info buffer. */
+  g_auto(GStrv) lines = g_strsplit (cpuinfo, "\n", -1);
+  /* fields maps each literal field name to its surviving selector set.
+   * features is the deduplicated union assembled only after the per-field
+   * intersections are complete. Both tables own their string keys. */
+  g_autoptr(GHashTable) fields = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                                      g_free, (GDestroyNotify) g_hash_table_unref);
+  g_autoptr(GHashTable) features = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  GHashTableIter iter;
+  gpointer key, value;
+  g_autoptr(GPtrArray) result = g_ptr_array_new_with_free_func (g_free);
+  gsize i;
+
+  for (i = 0; lines[i] != NULL; i++)
+    {
+      char *colon = strchr (lines[i], ':');
+      char *field, *contents;
+      gboolean named_features;
+      gboolean riscv_isa;
+      g_auto(GStrv) words = NULL;
+      g_autoptr(GHashTable) current = NULL;
+      GHashTable *previous;
+      gsize j;
+
+      /* Blank lines and text without a field separator supply no selectors.
+       * Split only at the first colon: later colons may belong to the value,
+       * such as ARC's embedded "FPU:" description. */
+      if (colon == NULL)
+        continue;
+      *colon = '\0';
+      /* Kernel alignment tabs/spaces are not part of field identity. Internal
+       * spaces and case remain significant for qualified selectors. */
+      field = g_strstrip (lines[i]);
+      contents = g_strstrip (colon + 1);
+      /* These conventional list labels also provide short aliases such as
+       * "avx" or "fjfmau". This is not an allowlist for qualified selectors:
+       * every field, including a future or unfamiliar one, is handled below.
+       * Do not publish bare tokens from arbitrary descriptive fields: a CPU
+       * model containing "avx" must not prove that AVX is available. */
+      named_features = g_str_equal (field, "flags") ||
+        g_ascii_strcasecmp (field, "features") == 0 ||
+        g_str_equal (field, "cpucaps") ||
+        g_str_equal (field, "vmx flags") ||
+        g_str_equal (field, "power management") ||
+        g_str_equal (field, "ASEs implemented");
+      /* RISC-V is a convenience decoding of a packed ISA string, rather than
+       * a host-architecture compile-time branch. MIPS also calls a field
+       * "isa", so the rv32/rv64 prefix distinguishes its representation. */
+      riscv_isa = g_str_equal (field, "isa") &&
+        (g_str_has_prefix (contents, "rv32") || g_str_has_prefix (contents, "rv64"));
+
+      /* Start a fresh selector set for this occurrence of the field. Keeping
+       * exact-value selectors permits boolean/version checks even on CPUs
+       * whose kernel provides no feature list or nonzero HWCAP words. */
+      current = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+      g_hash_table_add (current, g_strdup_printf ("cpuinfo:%s=%s", field, contents));
+      /* Some architectures expose capabilities as a scalar register instead
+       * of named flags (for example C-SKY). Test individual bits without any
+       * architecture-specific register or feature-name table.
+       */
+      /* Negative, empty, or descriptive values still have exact-value/token
+       * selectors, but cannot masquerade as unsigned register bit masks. */
+      if (g_ascii_isdigit (contents[0]))
+        {
+          char *end;
+          guint64 bits;
+          gsize bit;
+
+          /* Parse a whole decimal or 0x-prefixed hexadecimal value. Resetting
+           * errno and checking the end pointer rejects overflow and trailing
+           * text instead of treating a numeric prefix as a capability mask. */
+          errno = 0;
+          bits = g_ascii_strtoull (contents, &end,
+                                  g_str_has_prefix (contents, "0x") ||
+                                  g_str_has_prefix (contents, "0X") ? 16 : 10);
+          /* A 64-bit constant makes bit 63 valid on a 32-bit build too. Never
+           * shift by 64: it is outside the supported scalar width and C's
+           * defined shift range. Emit only bits actually set in the value. */
+          if (errno == 0 && *end == '\0')
+            for (bit = 0; bit < 64; bit++)
+              if (bits & (G_GUINT64_CONSTANT (1) << bit))
+                g_hash_table_add (current, g_strdup_printf ("cpuinfo:%s#%" G_GSIZE_FORMAT, field, bit));
+        }
+      /* Lists usually use whitespace; SPARC uses commas. Preserve underscores
+       * in ordinary tokens (for example constant_tsc). Only RISC-V's packed
+       * ISA representation treats underscores as extension separators. */
+      words = g_strsplit_set (contents, riscv_isa ? "_" : " \t\r,", -1);
+      for (j = 0; words[j] != NULL; j++)
+        {
+          /* Repeated separators are formatting, not empty feature names. */
+          if (words[j][0] == '\0')
+            continue;
+          /* Qualified tokens always retain their source field, avoiding
+           * collisions between otherwise identical words in different lists. */
+          g_hash_table_add (current, g_strdup_printf ("cpuinfo:%s:%s", field, words[j]));
+          /* Named list fields and RISC-V multi-letter extensions additionally
+           * satisfy their unqualified spelling. */
+          if (named_features || (riscv_isa && j > 0))
+            g_hash_table_add (current, g_strdup (words[j]));
+          if (riscv_isa && j == 0)
+            {
+              const char *extension;
+
+              /* Linux concatenates single-letter RISC-V extensions after rv32/rv64. */
+              /* Skip the four-character rv32/rv64 prefix. Subsequent
+               * underscore-separated chunks were already handled above. */
+              for (extension = words[j] + 4; *extension != '\0'; extension++)
+                {
+                  g_autofree char *name = g_strndup (extension, 1);
+
+                  g_hash_table_add (current, g_strdup (name));
+                  g_hash_table_add (current, g_strdup_printf ("cpuinfo:%s:%s", field, name));
+                }
+            }
+        }
+
+      /* The first occurrence establishes this field's set. Later occurrences
+       * intersect it: avx present on one reported processor and absent from
+       * another occurrence of flags must not survive. Fields absent entirely
+       * from a processor record are not inferred here; aggregation is by
+       * repeated field name, not by detecting CPU record boundaries. */
+      previous = g_hash_table_lookup (fields, field);
+      if (previous == NULL)
+        g_hash_table_insert (fields, g_strdup (field), g_steal_pointer (&current));
+      else
+        {
+          /* Remove through the iterator, which permits mutation during
+           * iteration. current is temporary; previous remains owned by fields. */
+          g_hash_table_iter_init (&iter, previous);
+          while (g_hash_table_iter_next (&iter, &key, NULL))
+            if (!g_hash_table_contains (current, key))
+              g_hash_table_iter_remove (&iter);
+        }
+    }
+
+  /* Independent fields contribute a union, not an intersection: ept from
+   * vmx flags and avx from flags can both be available simultaneously. */
+  g_hash_table_iter_init (&iter, fields);
+  while (g_hash_table_iter_next (&iter, NULL, &value))
+    {
+      GHashTableIter field_iter;
+
+      g_hash_table_iter_init (&field_iter, value);
+      while (g_hash_table_iter_next (&field_iter, &key, NULL))
+        g_hash_table_add (features, g_strdup (key));
+    }
+
+  /* A NULL HWCAP pointer lets fixtures exercise CPU info alone. An all-zero
+   * array is also meaningful: many Linux architectures publish no HWCAP bits.
+   * Numeric bit names avoid maintaining an architecture-specific name table. */
+  if (hwcaps != NULL)
+    {
+      const char *names[] = { "hwcap", "hwcap2", "hwcap3", "hwcap4" };
+      gsize bit;
+
+      /* HWCAP word width follows the process ABI (unsigned long), unlike the
+       * fixed 64-bit numeric CPU-info selector above. 1UL matches that width. */
+      for (i = 0; i < G_N_ELEMENTS (names); i++)
+        for (bit = 0; bit < sizeof (unsigned long) * CHAR_BIT; bit++)
+          if (hwcaps[i] & (1UL << bit))
+            g_hash_table_add (features, g_strdup_printf ("%s:%" G_GSIZE_FORMAT, names[i], bit));
+    }
+
+  /* Copy the union into the caller-owned vector before the temporary hash
+   * tables are released. Hash iteration order is deliberately unspecified;
+   * callers must test membership, never rely on selector ordering. */
+  g_hash_table_iter_init (&iter, features);
+  while (g_hash_table_iter_next (&iter, &key, NULL))
+    g_ptr_array_add (result, g_strdup (key));
+  g_ptr_array_add (result, NULL);
+  return (char **) g_ptr_array_free (g_steal_pointer (&result), FALSE);
+}
+
+/* Read only the host interfaces needed by the declared requirements, then
+ * require every list entry to be present. This helper has no installation
+ * policy: flatpak_dir_check_required_metadata() applies the opt-out setting.
+ */
+gboolean
+flatpak_check_required_cpu_features (const char *ref,
+                                     GKeyFile   *metakey,
+                                     GError    **error)
+{
+  /* Apps and runtime refs keep their requirements in different groups.
+   * Extensions are runtime refs and use [Runtime] as well. */
+  const char *group = g_str_has_prefix (ref, "app/") ?
+    FLATPAK_METADATA_GROUP_APPLICATION : FLATPAK_METADATA_GROUP_RUNTIME;
+  g_auto(GStrv) required = NULL;
+  g_auto(GStrv) available = NULL;
+  g_autofree char *cpuinfo = NULL;
+  unsigned long hwcaps[4] = { 0 };
+  gboolean needs_cpuinfo = FALSE;
+  gboolean needs_auxv = FALSE;
+  gsize i;
+
+  /* Preserve existing metadata behavior: no key means no CPU requirement,
+   * so neither proc file needs to be readable in this case. */
+  if (!g_key_file_has_key (metakey, group, FLATPAK_METADATA_KEY_REQUIRED_CPU_FEATURES, NULL))
+    return TRUE;
+
+  /* Use GKeyFile's semicolon-list parser rather than splitting raw metadata.
+   * Malformed escaping is an error; it must not disable enforcement. A valid
+   * empty list, in contrast, explicitly imposes no requirements. */
+  required = g_key_file_get_string_list (metakey, group,
+                                         FLATPAK_METADATA_KEY_REQUIRED_CPU_FEATURES,
+                                         NULL, error);
+  if (required == NULL)
+    return FALSE;
+  if (required[0] == NULL)
+    return TRUE;
+
+  /* An HWCAP-only package must not depend on /proc/cpuinfo availability.
+   * Conversely, a CPU-info-only package need not expose /proc/self/auxv.
+   * Unknown selector spellings take the CPU-info path and will not match. */
+  for (i = 0; required[i] != NULL; i++)
+    {
+      if (g_str_has_prefix (required[i], "hwcap:") ||
+          g_str_has_prefix (required[i], "hwcap2:") ||
+          g_str_has_prefix (required[i], "hwcap3:") ||
+          g_str_has_prefix (required[i], "hwcap4:"))
+        needs_auxv = TRUE;
+      else
+        needs_cpuinfo = TRUE;
+    }
+
+  /* Failure to inspect required host data is a failure to establish
+   * compatibility. Prefix the I/O error with the ref being checked. */
+  if (needs_cpuinfo && !g_file_get_contents ("/proc/cpuinfo", &cpuinfo, NULL, error))
+    {
+      g_prefix_error (error, _("Unable to check CPU requirements for %s: "), ref);
+      return FALSE;
+    }
+
+  if (needs_auxv)
+    {
+      g_autofree char *auxv = NULL;
+      gsize length, offset;
+      /* AT_HWCAP3 and AT_HWCAP4 were added after some supported libc headers.
+       * Their Linux UAPI numbers are 29 and 30 on every architecture.
+       */
+      const unsigned long types[] = { AT_HWCAP, AT_HWCAP2, 29, 30 };
+
+      /* Read the kernel values directly: some libcs mask getauxval(AT_HWCAP). */
+      if (!g_file_get_contents ("/proc/self/auxv", &auxv, &length, error))
+        {
+          g_prefix_error (error, _("Unable to check CPU requirements for %s: "), ref);
+          return FALSE;
+        }
+
+      /* /proc/self/auxv consists of native-ABI (type, value) word pairs.
+       * Reading our own process means native endianness and word size are
+       * already correct on 32-bit, 64-bit, little- and big-endian machines.
+       * The bound requires a complete pair before copying, and memcpy avoids
+       * alignment assumptions about GLib's byte buffer. */
+      for (offset = 0; length - offset >= 2 * sizeof (unsigned long); offset += 2 * sizeof (unsigned long))
+        {
+          unsigned long entry[2];
+
+          memcpy (entry, auxv + offset, sizeof (entry));
+          /* AT_NULL terminates the vector. Ignore unrelated auxiliary entries;
+           * absent HWCAP words keep their initialized zero value. */
+          if (entry[0] == AT_NULL)
+            break;
+          for (i = 0; i < G_N_ELEMENTS (types); i++)
+            if (entry[0] == types[i])
+              hwcaps[i] = entry[1];
+        }
+    }
+
+  /* Empty CPU info is intentional for HWCAP-only requirements. The parser
+   * produces the same exact selector strings that publishers put in metadata. */
+  available = flatpak_get_cpu_features (cpuinfo != NULL ? cpuinfo : "", hwcaps);
+  /* The list is conjunctive: a single missing or unknown capability blocks
+   * the operation. Return a stable CPU-specific error code and name the first
+   * unmet requirement so both library callers and CLI users can diagnose it. */
+  for (i = 0; required[i] != NULL; i++)
+    if (!g_strv_contains ((const char * const *) available, required[i]))
+      return flatpak_fail_error (error, FLATPAK_ERROR_UNSUPPORTED_CPU,
+                                 _("%s requires CPU feature %s, which is not available on this system"),
+                                 ref, required[i]);
+
+  return TRUE;
 }
 
 gboolean

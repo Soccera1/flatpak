@@ -228,8 +228,11 @@ get_lang_default (FlatpakDir *dir)
   return g_strjoinv (";", langs);
 }
 
+/* Both OS reporting and CPU validation default to enabled. Share the default
+ * printer so `config --list` describes the CPU policy even with no stored key.
+ */
 static char *
-get_report_os_info_default (FlatpakDir *dir)
+get_true_default (FlatpakDir *dir)
 {
   return g_strdup ("true");
 }
@@ -245,7 +248,10 @@ typedef struct
 ConfigKey keys[] = {
   { "languages", parse_lang, print_lang, get_lang_default },
   { "extra-languages", parse_locale, print_locale, NULL },
-  { "report-os-info", parse_boolean, print_boolean, get_report_os_info_default },
+  { "report-os-info", parse_boolean, print_boolean, get_true_default },
+  /* The existing boolean parser accepts only true/false. Persistence and
+   * installation selection use the normal flatpak config machinery. */
+  { "check-cpu-features", parse_boolean, print_boolean, get_true_default },
 };
 
 static ConfigKey *

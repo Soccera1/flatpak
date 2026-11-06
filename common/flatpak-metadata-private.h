@@ -31,6 +31,9 @@ G_BEGIN_DECLS
 #define FLATPAK_METADATA_KEY_COMMAND "command"
 #define FLATPAK_METADATA_KEY_NAME "name"
 #define FLATPAK_METADATA_KEY_REQUIRED_FLATPAK "required-flatpak"
+/* Optional semicolon-separated requirements in [Application] or [Runtime].
+ * This is distinct from [Context] features, which describes sandbox access. */
+#define FLATPAK_METADATA_KEY_REQUIRED_CPU_FEATURES "required-cpu-features"
 #define FLATPAK_METADATA_KEY_RUNTIME "runtime"
 #define FLATPAK_METADATA_KEY_SDK "sdk"
 #define FLATPAK_METADATA_KEY_TAGS "tags"

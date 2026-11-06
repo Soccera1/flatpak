@@ -76,6 +76,20 @@
                    (for example, <literal>en;en_DK;zh_HK.big5hkscs;uz_UZ.utf8@cyrillic</literal>).
                 </para></listitem>
             </varlistentry>
+            <!-- Review: flatpak_dir_check_required_metadata applies this
+                 installation-wide opt-out at transaction and deployment time.
+                 An unset key retains enforcement; only false disables it. -->
+            <varlistentry>
+                <term><varname>check-cpu-features</varname></term>
+                <listitem><para>
+                   Check the <literal>required-cpu-features</literal> metadata when
+                   installing or updating applications and runtimes. The default is
+                   <literal>true</literal>. Set to <literal>false</literal> to allow
+                   installation even when the running CPU lacks required features,
+                   for example when preparing an installation for another machine.
+                   This does not make incompatible code runnable.
+                </para></listitem>
+            </varlistentry>
             <varlistentry>
                 <term><varname>report-os-info</varname></term>
                 <listitem><para>

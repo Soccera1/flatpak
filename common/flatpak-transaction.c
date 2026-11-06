@@ -5132,8 +5132,11 @@ _run_op_kind (FlatpakTransaction           *self,
 
       g_assert (op->resolved_commit != NULL || op->resolved_image_source != NULL); /* We resolved this before */
 
-      if (op->resolved_metakey && !flatpak_check_required_version (flatpak_decomposed_get_ref (op->ref),
-                                                                   op->resolved_metakey, &local_error))
+      /* Reject an incompatible remote install using resolved metadata before
+       * pulling/deploying it. The deployment layer independently rechecks the
+       * checkout, and this path also covers download-only transactions. */
+      if (op->resolved_metakey && !flatpak_dir_check_required_metadata (priv->dir, flatpak_decomposed_get_ref (op->ref),
+                                                                        op->resolved_metakey, &local_error))
         res = FALSE;
       else
         res = flatpak_dir_install (priv->dir,
@@ -5200,8 +5203,11 @@ _run_op_kind (FlatpakTransaction           *self,
 
           emit_new_op (self, op, progress);
 
-          if (op->resolved_metakey && !flatpak_check_required_version (flatpak_decomposed_get_ref (op->ref),
-                                                                       op->resolved_metakey, &local_error))
+          /* Apply requirements to the proposed update before replacing a
+           * working deployment, including an update that only deploys an
+           * already cached commit. */
+          if (op->resolved_metakey && !flatpak_dir_check_required_metadata (priv->dir, flatpak_decomposed_get_ref (op->ref),
+                                                                            op->resolved_metakey, &local_error))
             res = FALSE;
           else if (op->update_only_deploy)
             res = flatpak_dir_deploy_update (priv->dir, op->ref,
@@ -5261,8 +5267,10 @@ _run_op_kind (FlatpakTransaction           *self,
     {
       g_autoptr(FlatpakTransactionProgress) progress = flatpak_transaction_progress_new ();
       emit_new_op (self, op, progress);
-      if (op->resolved_metakey && !flatpak_check_required_version (flatpak_decomposed_get_ref (op->ref),
-                                                                   op->resolved_metakey, error))
+      /* Bundles use the same requirement/config policy as remote installs;
+       * an offline delivery format must not skip compatibility validation. */
+      if (op->resolved_metakey && !flatpak_dir_check_required_metadata (priv->dir, flatpak_decomposed_get_ref (op->ref),
+                                                                        op->resolved_metakey, error))
         res = FALSE;
       else
         res = flatpak_dir_install_bundle (priv->dir, priv->reinstall, op->bundle,

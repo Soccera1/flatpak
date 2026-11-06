@@ -34,6 +34,15 @@ runtime=org.test.Platform/$ARCH/$RUNTIME_BRANCH
 sdk=org.test.Platform/$ARCH/$RUNTIME_BRANCH
 EOF
 
+# Test whether the variable is set, not whether it is nonempty: fixtures may
+# need either an explicit empty requirements list or no metadata key at all.
+# Append while still inside [Application], before later groups are emitted.
+if [ "${REQUIRED_CPU_FEATURES+x}" = x ]; then
+cat >> ${DIR}/metadata <<EOF
+required-cpu-features=$REQUIRED_CPU_FEATURES
+EOF
+fi
+
 if [ x${REQUIRED_VERSION-} != x ]; then
 cat >> ${DIR}/metadata <<EOF
 required-flatpak=$REQUIRED_VERSION

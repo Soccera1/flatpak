@@ -384,6 +384,9 @@ tests = {
   'basic': {},
   'completion': {},
   'config': {},
+  # Run the same requirement/opt-out scenarios against user and privileged
+  # system installations; repository setup makes this slower than a unit test.
+  'cpu-features': {'timeout': 120, 'wrap': ['user', 'system']},
   'documents': {},
   'build-update-repo': {},
   'http-utils': {'depends': [httpcache_exe]},

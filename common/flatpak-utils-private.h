@@ -318,6 +318,17 @@ GBytes *flatpak_load_file_at (int           dfd,
                               GCancellable *cancellable,
                               GError      **error);
 
+/* Pure parser: returns owned selector strings; accepts simulated CPU info and
+ * optional native-ABI HWCAP words so tests do not depend on host architecture. */
+char **flatpak_get_cpu_features (const char          *cpuinfo,
+                                  const unsigned long hwcaps[4]);
+
+/* Host-facing check: reads required proc interfaces and reports the first
+ * unmet requirement. Installation-level opt-out is handled by FlatpakDir. */
+gboolean flatpak_check_required_cpu_features (const char *ref,
+                                              GKeyFile   *metakey,
+                                              GError    **error);
+
 gboolean flatpak_check_required_version (const char *ref,
                                          GKeyFile   *metakey,
                                          GError    **error);

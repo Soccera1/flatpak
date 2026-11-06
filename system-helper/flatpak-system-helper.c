@@ -1130,8 +1130,12 @@ handle_configure (FlatpakSystemHelper   *object,
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
+  /* The configuration CLI and privileged helper have separate key lists.
+   * Allow the CPU opt-out here as well so system installations can persist
+   * the same setting that user installations write directly. */
   if ((strcmp (arg_key, "languages") != 0) &&
       (strcmp (arg_key, "extra-languages") != 0) &&
+      (strcmp (arg_key, "check-cpu-features") != 0) &&
       (strcmp (arg_key, "masked") != 0) &&
       (strcmp (arg_key, "pinned") != 0))
     {
